@@ -17,6 +17,17 @@ $ npm run start:dev
 $ npm run start:prod
 ```
 
+## Compile and run the project with docker
+
+```bash
+# build the project
+$ docker-compose build
+
+# run the project
+$ docker-compose up -d
+```
+
+
 ## Run tests
 
 ```bash

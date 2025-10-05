@@ -12,12 +12,11 @@ export class GlobalBasicAuthGuard extends BasicAuthGuard implements CanActivate 
   canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
     const request = context.switchToHttp().getRequest();
     
-    // Skip basic auth for guest endpoints, login endpoint and healthcheck
+    // Skip basic auth for login endpoint and healthcheck
     if (request.url === '/auth/login' || 
         request.url.startsWith('/auth/login') ||
         request.url === '/healthcheck' ||
-        request.url.startsWith('/healthcheck') ||
-        request.url.startsWith('/reservations/guest/')) {
+        request.url.startsWith('/healthcheck')) {
       return true;
     }
     

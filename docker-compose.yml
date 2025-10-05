@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: . 
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      MONGODB_URL: mongodb://mongodb:27017/test
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: always
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    restart: always
+    healthcheck:
+      test: "echo 'db.runCommand({ping: 1})' | mongosh localhost:27017/local-test --quiet"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+volumes:
+  mongodb_data:
+    driver: local
