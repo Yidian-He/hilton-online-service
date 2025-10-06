@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, InternalServerErrorException, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { CreateReservationDto } from './dto/create-reservation.dto';
@@ -8,6 +8,8 @@ import { Reservation, ReservationDocument, ReservationStatus } from './entities/
 
 @Injectable()
 export class ReservationsService {
+  private readonly logger = new Logger(ReservationsService.name);
+
   constructor(
     @InjectModel(Reservation.name) private reservationModel: Model<ReservationDocument>,
   ) {}
@@ -17,12 +19,14 @@ export class ReservationsService {
     // Validate phone number
     const phoneRegex = /^1[3-9]\d{9}$/;
     if (!phoneRegex.test(createReservationDto.guestPhone)) {
+      this.logger.warn(`Invalid phone number format: ${createReservationDto.guestPhone}`);
       throw new BadRequestException('Invalid phone number.');
     }
     
     // Validate arrival time is in the future
     const arrivalDate = new Date(createReservationDto.expectedArrivalDate);
     if (arrivalDate <= new Date()) {
+      this.logger.warn(`Invalid arrival date: ${arrivalDate}, must be in the future`);
       throw new BadRequestException('Expected arrival time must be in the future');
     }
 
@@ -31,40 +35,50 @@ export class ReservationsService {
 
     // Generate a random reservation code with 6 mixed digits and letters
     const randomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    this.logger.debug(`Generated reservation code: ${randomCode}`);
 
     // Ensure the generated code is unique
     const existingCode = await this.reservationModel.findOne({ reservationCode: randomCode });
     if (existingCode) {
-      // Recursively generate a new code if collision occurs
+      this.logger.warn(`Code collision detected: ${randomCode}, regenerating...`);
       return this.create(createReservationDto);
     }
 
     // Create reservation with combined data
-    const reservationData = {
-      ...createReservationDto,
-      expectedArrivalDate: arrivalDate,
-      reservationCode: randomCode,
-    };
+    try {
+      const reservationData = {
+        ...createReservationDto,
+        expectedArrivalDate: arrivalDate,
+        reservationCode: randomCode,
+      };
 
-    const reservation = new this.reservationModel(reservationData);
-    const savedReservation = await reservation.save();
-
-    return this.toReservationResponse(savedReservation);
+      const reservation = new this.reservationModel(reservationData);
+      const savedReservation = await reservation.save();
+      
+      this.logger.debug(`Successfully created reservation: ${savedReservation._id}`);
+      return this.toReservationResponse(savedReservation);
+    } catch (error) {
+      this.logger.error(`Failed to create reservation: ${error.message}`);
+      throw new InternalServerErrorException('Failed to create reservation');
+    }
   }
 
   // Guest functionality: Update a reservation
   async update(id: string, updateReservationDto: UpdateReservationDto): Promise<ReservationResponseDto> {
     if (!Types.ObjectId.isValid(id)) {
+      this.logger.warn(`Invalid reservation ID format: ${id}`);
       throw new BadRequestException('Invalid reservation ID');
     }
 
     const reservation = await this.reservationModel.findById(id).exec();
     if (!reservation) {
+      this.logger.warn(`Reservation not found: ${id}`);
       throw new NotFoundException('Reservation not found');
     }
 
     // Validate status, only requested status can be updated
     if (reservation.status && reservation.status !== ReservationStatus.REQUESTED) {
+      this.logger.warn(`Cannot update reservation ${id} with status: ${reservation.status}`);
       throw new BadRequestException('Reservation is not in pending status, cannot be updated');
     }
 
@@ -72,6 +86,7 @@ export class ReservationsService {
     if (updateReservationDto.expectedArrivalDate) {
       const newArrivalDate = new Date(updateReservationDto.expectedArrivalDate);
       if (newArrivalDate <= new Date()) {
+        this.logger.warn(`Invalid new arrival date: ${newArrivalDate}`);
         throw new BadRequestException('Arrival time must be in the future');
       }
 
@@ -79,6 +94,7 @@ export class ReservationsService {
       const prevDate = reservation.expectedArrivalDate.toDateString();
       const newDate = newArrivalDate.toDateString();
       if (prevDate !== newDate) {
+        this.logger.debug(`Date changed from ${prevDate} to ${newDate}, checking conflicts`);
         await this.checkConfilct(reservation.guestPhone, newArrivalDate);
       }
 
@@ -98,20 +114,26 @@ export class ReservationsService {
 
   // Guest functionality: Cancel their reservation
   async cancelByGuest(id: string, updateStatusDto: UpdateReservationStatusDto, guestId: Types.ObjectId): Promise<ReservationResponseDto> {
+    this.logger.log(`Guest ${guestId} cancelling reservation: ${id}`);
+
     if (!Types.ObjectId.isValid(id)) {
+      this.logger.warn(`Invalid reservation ID format: ${id}`);
       throw new BadRequestException('Invalid reservation ID');
     }
 
     const reservation = await this.reservationModel.findById(id).exec();
     if (!reservation) {
+      this.logger.warn(`Reservation not found: ${id}`);
       throw new NotFoundException('Reservation not found');
     }
 
     // Only allow cancellation if not already cancelled or completed
     if (reservation.status === ReservationStatus.CANCELLED) {
+      this.logger.warn(`Reservation ${id} is already cancelled`);
       throw new BadRequestException('Reservation is already cancelled');
     }
     if (reservation.status === ReservationStatus.COMPLETED) {
+      this.logger.warn(`Cannot cancel completed reservation: ${id}`);
       throw new BadRequestException('Cannot cancel a completed reservation');
     }
 
@@ -188,40 +210,46 @@ export class ReservationsService {
   // Employee functionality: Update reservation status
   async updateStatus(id: string, updateStatusDto: UpdateReservationStatusDto, employeeId: Types.ObjectId): Promise<ReservationResponseDto> {
     if (!Types.ObjectId.isValid(id)) {
+      this.logger.warn(`Invalid reservation ID format: ${id}`);
       throw new BadRequestException('Invalid reservation ID');
     }
 
     const reservation = await this.reservationModel.findById(id).exec();
     if (!reservation) {
+      this.logger.warn(`Reservation not found: ${id}`);
       throw new NotFoundException('Reservation not found');
     }
 
     // Validate status transition
     if (!Object.values(ReservationStatus).includes(updateStatusDto.status)) {
+      this.logger.warn(`Invalid status provided: ${updateStatusDto.status}`);
       throw new BadRequestException('Invalid status');
     }
 
     // Validate if status changed
     if (reservation.status === updateStatusDto.status) {
-      throw new InternalServerErrorException('Status not changed')
+      this.logger.warn(`Status not changed: ${updateStatusDto.status}`);
+      throw new BadRequestException('Status not changed');
     } else if (reservation.status === ReservationStatus.CANCELLED) {
+      this.logger.warn(`Cannot update cancelled reservation: ${id}`);
       throw new BadRequestException('Cannot update cancelled reservation');
     } else if (reservation.status === ReservationStatus.COMPLETED) {
+      this.logger.warn(`Cannot update completed reservation: ${id}`);
       throw new BadRequestException('Cannot update completed reservation');
     }
 
-    // Update status and processing remarks
-    reservation.status = updateStatusDto.status;
-    if (updateStatusDto.remarks) {
-      reservation.remarks = updateStatusDto.remarks;
-    }
+      // Update status and processing remarks
+      reservation.status = updateStatusDto.status;
+      if (updateStatusDto.remarks) {
+        reservation.remarks = updateStatusDto.remarks;
+      }
 
-    const updateData = {
-      ...updateStatusDto,
-    };
+      const updateData = {
+        ...updateStatusDto,
+      };
 
-    const updatedReservation = await this.reservationModel.findByIdAndUpdate(id, updateData, { new: true }).exec();
-    if (!updatedReservation) {
+      const updatedReservation = await this.reservationModel.findByIdAndUpdate(id, updateData, { new: true }).exec();
+      if (!updatedReservation) {
       throw new InternalServerErrorException('Failed to update reservation status');
     }
 
@@ -230,6 +258,10 @@ export class ReservationsService {
 
   // GraphQL query handler for reservations
   async graphql(body: { query: string; variables?: any }): Promise<ReservationGraphqlResponseDto> {
+    this.logger.log('Processing GraphQL query');
+    this.logger.debug(`Query: ${body.query}`);
+    this.logger.debug(`Variables: ${JSON.stringify(body.variables)}`);
+
     const { query, variables } = body;
     const filters: any = {};
     
@@ -334,6 +366,7 @@ export class ReservationsService {
         }
       };
     } catch (error) {
+      this.logger.error(`GraphQL query failed: ${error.message}`);
       throw new BadRequestException('Invalid GraphQL query or variables');
     }
   }
@@ -352,6 +385,7 @@ export class ReservationsService {
     });
 
     if (existingReservation) {
+      this.logger.warn(`Conflict found: Existing reservation ${existingReservation._id} for ${phone} on ${arrivalDate}`);
       throw new ConflictException('You already have an active reservation for this date');
     }
 
@@ -381,6 +415,4 @@ export class ReservationsService {
       arrivalDate: (reservation as any).arrivalDate,
     };
   }
-
-
 }
