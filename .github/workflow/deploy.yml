@@ -1,0 +1,119 @@
+name: Deploy to EC2 and CloudFront
+
+on:
+  release:
+    types: [created]
+
+env:
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+  EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ap-southheast-1 
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+  CLOUDFRONT_DOMAIN: ${{ secrets.CLOUDFRONT_DOMAIN }} 
+  CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
+  IMAGE_NAME: yidianhe327/hilton-online-service
+  IMAGE_TAG: ${{ github.event.release.tag_name }}
+  CONTAINER_NAME: hilton-online-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Build docker image
+      run: |
+        docker build -t $IMAGE_NAME:$IMAGE_TAG .
+
+    - name: Set up SSH
+      run: |
+        echo "$EC2_SSH_PRIVATE_KEY" > ec2_key.pem
+        chmod 400 ec2_key.pem
+
+    - name: Deploy to EC2
+      run: |
+        ssh -i ec2_key.pem -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << 'EOF'
+        set -e
+
+        echo "Starting deployment..."
+
+        # Pull the docker image on the EC2 instance
+        cd ~
+        if ! docker pull $IMAGE_NAME:$IMAGE_TAG; then
+          echo "Failed to pull image"
+          exit 1
+        fi
+
+        # Stop and remove the old container
+        echo "Stopping old container..."
+        docker stop $CONTAINER_NAME || true
+        docker rm $CONTAINER_NAME || true
+
+        # Run the new container
+        echo "Starting new container..."
+        if ! docker run -d --name $CONTAINER_NAME \
+          -p 0.0.0.0:80:3000 \
+          --env-file .env \
+          -e CORS_ORIGIN="$CORS_ALLOWED_ORIGINS" \
+          -e CLOUDFRONT_DOMAIN="$CLOUDFRONT_DOMAIN" \
+          --restart unless-stopped \
+          $IMAGE_NAME:$IMAGE_TAG; then
+          echo "Failed to start container"
+          exit 1
+        fi
+
+        # Verify container is running
+        echo "Verifying container status..."
+        sleep 10
+        if ! docker ps | grep -q $CONTAINER_NAME; then
+          echo "Container is not running"
+          echo "Container logs:"
+          docker logs $CONTAINER_NAME
+          exit 1
+        fi
+
+        # Healthcheck on application
+        for i in {1..6}; do
+          if curl -s http://localhost/healthcheck > /dev/null; then
+            echo "Application is healthy!"
+            exit 0
+          fi
+          echo "Waiting for application to be ready... (attempt $i/6)"
+          sleep 10
+        done
+
+        echo "Application failed to start"
+        echo "Container logs:"
+        docker logs $CONTAINER_NAME
+        exit 1
+
+        EOF
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Invalidate CloudFront cache
+      run: |
+        echo "Invalidating CloudFront cache..."
+        # Invalidate API routes and dynamic content
+        aws cloudfront create-invalidation \
+          --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+          --paths "/api/*" "/auth/*" "/healthcheck"
+        
+        # Invalidate static assets only if they've changed
+        if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -q "^public/"; then
+          echo "Static assets changed, invalidating assets cache..."
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/assets/*" "/images/*"
+        fi
